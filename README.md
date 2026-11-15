@@ -1,4 +1,4 @@
-# Skylight Lists — reviewed personal fork
+# Skylight Lists
 
 **Experimental, unofficial Home Assistant integration for Skylight shopping/to-do lists only.**
 It exposes each Skylight list as a Home Assistant `todo` entity so a sync engine can pair it
@@ -73,7 +73,7 @@ before you connect a household list.
 ## Installation (Home Assistant Marketplace / HACS)
 
 1. HACS → ⋮ → **Custom repositories** → add `https://github.com/ct3685/skylight_calendar`, type **Integration**.
-2. Open **Skylight Lists (Reviewed Fork)** → **Download** → restart Home Assistant.
+2. Open **Skylight Lists** → **Download** → restart Home Assistant.
 3. This integration uses the domain `skylight`. Do not install another Skylight integration at the same time.
 
 ### 1. Authenticate
