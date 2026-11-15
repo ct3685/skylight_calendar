@@ -78,12 +78,20 @@ before you connect a household list.
 
 ### 1. Authenticate
 
-1. Settings → Devices & services → **Add integration** → **Skylight Lists**.
-2. Click **Open Skylight sign-in**, sign in, and wait for the redirect to `ourskylight.com/welcome?code=…`.
-3. Copy the whole URL (or only the `code` value) into the form within about 30 seconds. Codes are single-use.
-4. If the account has several frames, pick the one with your lists.
-5. When tokens are later rejected (password change, revoked session), Home Assistant shows
-   **Re-authentication required**. Repeat steps 2–3 there.
+Skylight only redirects its OAuth client to its own web app (`ourskylight.com/welcome`),
+which immediately navigates away, so the code has to be captured from the browser's network log.
+
+1. Settings → Devices & services → **Add integration** → **Skylight Lists**. Keep this dialog open.
+2. In a new browser tab, press F12 → **Network** → tick **Preserve log**.
+3. In that tab, open the **Skylight sign-in** link from the dialog and sign in. If the browser
+   is already signed in to Skylight, the login form may be skipped. Check it is the right account.
+4. Skylight's page redirects a few times. Type `code=` in the Network filter and copy the first
+   `ourskylight.com/welcome?code=…` URL (right-click → Copy → Copy URL).
+5. Paste the whole URL (or only the code) into the dialog and submit straight away. Codes are single-use.
+   If a code is rejected, open the same dialog link again. It stays valid until the dialog closes.
+6. If the account has several frames, pick the one with your lists.
+7. When tokens are later rejected (password change, revoked session), Home Assistant shows
+   **Re-authentication required**. Repeat steps 2–5 there.
 
 Never paste codes, URLs containing `code=`, or `.storage` files into issues or chats.
 

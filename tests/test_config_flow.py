@@ -28,6 +28,8 @@ async def test_sign_in_creates_entry(hass: HomeAssistant, skylight: FakeSkylight
     url = result["description_placeholders"]["auth_url"]
     assert url.startswith("https://app.ourskylight.com/oauth/authorize?")
     assert "code_challenge_method=S256" in url
+    # No forced login, so an existing Skylight browser session can skip the form.
+    assert "prompt=" not in url
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {"code": CALLBACK})
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Test Home"
