@@ -5,7 +5,8 @@ Flow shape:
                        to sign in and paste back either the full callback URL
                        or just the ?code=... value.
   step_pick_frame    → if the account has >1 frame, choose which one.
-  step_reauth / step_reconfigure → same as step_user (reissues authorize URL).
+  step_reauth / step_reconfigure → same as step_user (reissues authorize URL),
+                       and the new sign-in must still see the entry's frame.
 """
 
 from __future__ import annotations
@@ -19,10 +20,15 @@ from typing import Any
 
 import voluptuous as vol
 
-from homeassistant import config_entries
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import (
+    SOURCE_REAUTH,
+    SOURCE_RECONFIGURE,
+    ConfigEntry,
+    ConfigFlow,
+    ConfigFlowResult,
+    OptionsFlow,
+)
 from homeassistant.core import callback
-from homeassistant.data_entry_flow import FlowResult
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import (
@@ -93,7 +99,7 @@ def _extract_code(raw: str) -> str | None:
     return raw
 
 
-class SkylightConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
+class SkylightConfigFlow(ConfigFlow, domain=DOMAIN):
     """OAuth authorization_code + PKCE config flow."""
 
     VERSION = 2
@@ -105,13 +111,12 @@ class SkylightConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         self._refresh_token: str = ""
         self._device_fingerprint: str = ""
         self._frames: list[dict] = []
-        self._reauth_entry: ConfigEntry | None = None
 
     # ── Primary user step ────────────────────────────────────────────────
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         errors: dict[str, str] = {}
 
         # Generate PKCE once per flow so refresh preserves it across form errors.
@@ -135,38 +140,31 @@ class SkylightConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                         code_verifier=self._verifier,
                         device_fingerprint=self._device_fingerprint,
                     )
-                except SkylightAuthError as err:
-                    _LOGGER.warning("OAuth code exchange failed: %s", err)
-                    errors["base"] = "invalid_auth"
-                except SkylightAPIError:
-                    _LOGGER.exception("Skylight OAuth token endpoint error")
-                    errors["base"] = "cannot_connect"
-                else:
                     self._access_token = tokens["access_token"]
                     self._refresh_token = tokens["refresh_token"]
-
-                    if self._reauth_entry is not None:
-                        return await self._finish_reauth()
-
                     api = SkylightAPI(
                         session=session,
                         access_token=self._access_token,
                         refresh_token=self._refresh_token,
                         device_fingerprint=self._device_fingerprint,
                     )
-                    try:
-                        self._frames = await api.get_frames()
-                    except SkylightAPIError:
-                        _LOGGER.exception("Failed to enumerate frames")
-                        errors["base"] = "cannot_connect"
+                    self._frames = await api.get_frames()
+                except SkylightAuthError as err:
+                    _LOGGER.warning("Skylight sign-in failed: %s", err)
+                    errors["base"] = "invalid_auth"
+                except SkylightAPIError as err:
+                    _LOGGER.warning("Skylight sign-in could not complete: %s", err)
+                    errors["base"] = "cannot_connect"
 
-                    if not errors:
-                        if not self._frames:
-                            errors["base"] = "no_frames"
-                        elif len(self._frames) == 1:
-                            return await self._create_entry(self._frames[0])
-                        else:
-                            return await self.async_step_pick_frame()
+                if not errors:
+                    if self.source in (SOURCE_REAUTH, SOURCE_RECONFIGURE):
+                        return self._finish_reauth()
+                    if not self._frames:
+                        errors["base"] = "no_frames"
+                    elif len(self._frames) == 1:
+                        return await self._create_entry(self._frames[0])
+                    else:
+                        return await self.async_step_pick_frame()
 
         return self.async_show_form(
             step_id="user",
@@ -179,7 +177,7 @@ class SkylightConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
 
     async def async_step_pick_frame(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         configured_ids = {
             e.data.get(CONF_FRAME_ID) for e in self._async_current_entries()
         }
@@ -199,7 +197,7 @@ class SkylightConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             data_schema=vol.Schema({vol.Required(CONF_FRAME_ID): vol.In(options)}),
         )
 
-    async def _create_entry(self, frame: dict) -> FlowResult:
+    async def _create_entry(self, frame: dict) -> ConfigFlowResult:
         await self.async_set_unique_id(f"skylight_frame_{frame['id']}")
         self._abort_if_unique_id_configured()
         return self.async_create_entry(
@@ -213,61 +211,51 @@ class SkylightConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             },
         )
 
-    # ── Reauth ──────────────────────────────────────────────────────────
+    # ── Reauth / reconfigure ────────────────────────────────────────────
 
-    async def async_step_reauth(self, entry_data: dict[str, Any]) -> FlowResult:
-        self._reauth_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
-        )
+    async def async_step_reauth(
+        self, entry_data: dict[str, Any]
+    ) -> ConfigFlowResult:
         return await self.async_step_user()
-
-    async def _finish_reauth(self) -> FlowResult:
-        entry = self._reauth_entry
-        assert entry is not None
-        new_data = {
-            **entry.data,
-            CONF_ACCESS_TOKEN: self._access_token,
-            CONF_REFRESH_TOKEN: self._refresh_token,
-            CONF_DEVICE_FINGERPRINT: self._device_fingerprint,
-        }
-        self.hass.config_entries.async_update_entry(entry, data=new_data)
-        await self.hass.config_entries.async_reload(entry.entry_id)
-        return self.async_abort(reason="reauth_successful")
-
-    # ── Reconfigure ─────────────────────────────────────────────────────
 
     async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
-        self._reauth_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
-        )
+    ) -> ConfigFlowResult:
         return await self.async_step_user()
+
+    def _finish_reauth(self) -> ConfigFlowResult:
+        entry = (
+            self._get_reauth_entry()
+            if self.source == SOURCE_REAUTH
+            else self._get_reconfigure_entry()
+        )
+        if entry.data.get(CONF_FRAME_ID) not in {f["id"] for f in self._frames}:
+            return self.async_abort(reason="wrong_account")
+        return self.async_update_reload_and_abort(
+            entry,
+            data_updates={
+                CONF_ACCESS_TOKEN: self._access_token,
+                CONF_REFRESH_TOKEN: self._refresh_token,
+                CONF_DEVICE_FINGERPRINT: self._device_fingerprint,
+            },
+        )
 
     @staticmethod
     @callback
-    def async_get_options_flow(
-        config_entry: ConfigEntry,
-    ) -> SkylightOptionsFlow:
-        return SkylightOptionsFlow(config_entry)
+    def async_get_options_flow(config_entry: ConfigEntry) -> SkylightOptionsFlow:
+        return SkylightOptionsFlow()
 
 
-class SkylightOptionsFlow(config_entries.OptionsFlow):
-    """Tune how often each Skylight resource is polled."""
-
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        # Stored privately rather than as self.config_entry: assigning that
-        # attribute is deprecated in current HA, but accepting the entry here
-        # still works across versions.
-        self._entry = config_entry
+class SkylightOptionsFlow(OptionsFlow):
+    """Tune how often Skylight lists are polled."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
-    ) -> FlowResult:
+    ) -> ConfigFlowResult:
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        options = self._entry.options
+        options = self.config_entry.options
         return self.async_show_form(
             step_id="init",
             data_schema=vol.Schema(

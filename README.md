@@ -1,475 +1,231 @@
-# Skylight for Home Assistant
+# Skylight Lists — reviewed personal fork
 
-> ⚠️ **v3.0.0 is a breaking change.** The integration domain was renamed `skylight_calendar` → `skylight`. Every entity ID, service name, and config entry needs to be redone.
->
-> **Upgrade procedure:**
-> 1. In HA: **Settings → Devices & Services → Skylight → three-dot menu → Delete**
-> 2. HACS: **Skylight → three-dot menu → Redownload → v3.0.0**
-> 3. Restart Home Assistant
-> 4. **Settings → Devices & Services → Add Integration → Skylight** — sign in again
-> 5. Update any automations/dashboards referencing `skylight_calendar.*` entity IDs or the `skylight_calendar.upload_media` service to use `skylight.*` and `skylight.upload_media`
->
-> The rename brings the domain in line with the display name and repo. It also removes the last "calendar" naming artifact from what is now a full-platform integration (calendar + chores + meals + tasks + rewards + lists + frame device controls + photo upload).
+**Experimental, unofficial Home Assistant integration for Skylight shopping/to-do lists only.**
+It exposes each Skylight list as a Home Assistant `todo` entity so a sync engine can pair it
+with Alexa's shopping list (or any other `todo` entity).
 
-Full [Skylight Calendar Frame](https://www.ourskylight.com/) integration for Home Assistant — calendar events, chores (whole-frame + per-family-member), meals (per-slot + full recipe detail), task box, shopping / to-do lists, reward stars, and frame device controls (brightness, slideshow speed, sleep mode).
+Forked from [MegaTheLEGEND/skylight_calendar](https://github.com/MegaTheLEGEND/skylight_calendar) at upstream commit
+[6d9b8dee](https://github.com/MegaTheLEGEND/skylight_calendar/commit/6d9b8dee9a5950c1fac89a20ec9314c7ef1203be).
+Original work is covered by the repository's MIT license.
 
-> ⚠️ v2.x is a breaking change from any pre-fork release. Auth is now proper OAuth2 (authorization code + PKCE) — you sign in through your browser during the config flow, no more manual token capture. Existing installations must be removed and re-added.
+## What it does
 
----
+- Signs in with Skylight's OAuth (authorization code + PKCE) and refreshes tokens automatically.
+- Creates one `todo` entity per Skylight list (shopping and to-do lists alike).
+- Reads, adds, completes, un-completes, renames and deletes list items.
+- Polls every 120 seconds by default (30–7200 s, configurable). Writes refresh immediately.
 
-## Features
+**Intentionally removed:** calendar events, chores, photos, image uploads, device
+settings, alarms, recipes, rewards and every domain-wide service. Creating or
+deleting whole Skylight lists is not supported.
 
-| HA Platform | Entities | Notes |
+**Not included:** synchronization itself. Use [To-do List Sync](#two-way-sync-with-alexa)
+for that.
+
+### Behaviour that matters for sync
+
+- **Outages never look like empty lists.** If Skylight times out, errors, returns malformed
+  JSON, paginates, or omits items it says the list contains, the refresh fails and *all*
+  Skylight `todo` entities become `unavailable` until the next good poll. An item without an
+  id fails the read rather than silently vanishing.
+- A Skylight list that is deleted (or disappears from the feed) turns its entity `unavailable`, not empty.
+- Completing an item keeps it in Skylight as completed (`status: completed`); un-completing sets `pending`.
+- Deletes are verified: after `DELETE`, the list is re-read. Items still present are retried
+  through Skylight's `bulk_destroy` endpoint. If they still remain, or the list cannot be
+  re-read, the action fails visibly. An unverified delete is never reported as done.
+- Duplicate item names are allowed. Items are addressed by their Skylight id.
+- Write failures raise an error from the `todo.*` action, so a sync engine sees them.
+
+## Security model and limitations
+
+- **The Skylight API is undocumented and unofficial.** Endpoints may change without notice.
+- **Skylight OAuth requests `scope=everything`.** The web/mobile OAuth client Skylight uses
+  offers no narrower scope that we could find (none of the community clients use one).
+  This fork reduces what the *code* does. It cannot stop a stolen token from reaching
+  calendar, photos, or other account data. Treat the Home Assistant config directory and backups
+  as holding full Skylight account access.
+- No Skylight password is stored. OAuth access/refresh tokens live in Home Assistant's
+  config-entry storage (`.storage/core.config_entries`), which is included in HA backups.
+- Requests only go to `https://app.ourskylight.com`. Redirects are never followed.
+  Resource ids are validated before they are placed in a URL path.
+- Tokens, request bodies and Skylight response bodies are never logged or put in error
+  messages. Errors only carry the method and HTTP status.
+- Re-authentication must sign in to an account that can still see the configured frame.
+  Otherwise it aborts (`wrong_account`).
+- No third-party Python dependencies, no services, no file access, no dynamic code.
+- This is a code review and hardening pass, **not** an independent security certification.
+
+## API contract and verification status
+
+| Operation | Request | Evidence |
 |---|---|---|
-| `calendar` | one aggregate + one per Skylight source calendar | Rolling ±14 / +60 day window. Standard `calendar.get_events` service works. Create events on the aggregate entity; edit and delete on any writable source calendar. |
-| `todo` | one per Skylight list (Grocery, To-Do, custom lists) + one chore queue per family member | Full create / rename / complete / delete round-trip. Chores created on a member's queue are assigned to them, and the due date sets the chore's day. |
-| `sensor` | see below | Rich `extra_state_attributes` for use in Lovelace + automations. |
-| `switch` | sleep mode, night light, show captions, show heart, blur effect, start sound, side by side | Direct write to the device. |
-| `number` | brightness (0–255), slideshow speed (0–240s), night light brightness, sleep sound volume | Direct write to the device. |
-| `time` | sleeps at, wakes at | The frame's sleep schedule. |
-| `binary_sensor` | screen asleep, activated | Read-only. "Screen asleep" is whether the display is *currently* off; the sleep mode switch is whether the schedule is armed. |
-| `image` | current frame photo | |
+| Read list items | `GET /api/frames/{frame}/lists/{list}?include=list_items` | Used live by upstream; fallback `GET …/list_items` |
+| Add item | `POST …/list_items` `{"label": "Milk"}` | Upstream, pyskylight, skylight-mcp |
+| Complete / un-complete | `PUT …/list_items/{id}` `{"status": "completed"\|"pending"}` | Upstream, pyskylight, skylight-mcp |
+| Rename | `PUT …/list_items/{id}` `{"label": "Oat milk"}` | pyskylight, skylight-mcp (upstream sent `name`, likely ignored) |
+| Delete | `DELETE …/list_items/{id}`, fallback `DELETE …/list_items/bulk_destroy` `{"ids": [...]}` | pyskylight, skylight-tools |
+| Token refresh | `POST /oauth/token` `grant_type=refresh_token` (rotating) | Upstream |
 
-Entities are only created for settings your frame actually reports — Skylight's device payload varies by hardware, and an absent key means "unsupported here" rather than "off". A handful of settings (`sleep_mode`, `nightlight_color`, `sleep_sound`, `slideshow_style`) are exposed as read-only diagnostic sensors rather than selects, because only one value of each enum has ever been observed and a guessed option list would produce controls that fail.
+**None of this has been verified live against Skylight by this fork.** The automated tests (below)
+run against an in-memory model of these contracts. Run the [disposable-list test](#3-test-with-a-disposable-skylight-list)
+before you connect a household list.
 
-### Skylight Buddy
+## Installation (Home Assistant Marketplace / HACS)
 
-A Buddy paired to the frame (a second device with `role: buddy`) gets its own HA device, named as in the app:
+1. HACS → ⋮ → **Custom repositories** → add `https://github.com/ct3685/skylight_calendar`, type **Integration**.
+2. Open **Skylight Lists (Reviewed Fork)** → **Download** → restart Home Assistant.
+3. This integration uses the domain `skylight`. Do not install another Skylight integration at the same time.
 
-| HA Platform | Entities | Notes |
+### 1. Authenticate
+
+1. Settings → Devices & services → **Add integration** → **Skylight Lists**.
+2. Click **Open Skylight sign-in**, sign in, and wait for the redirect to `ourskylight.com/welcome?code=…`.
+3. Copy the whole URL (or only the `code` value) into the form within about 30 seconds. Codes are single-use.
+4. If the account has several frames, pick the one with your lists.
+5. When tokens are later rejected (password change, revoked session), Home Assistant shows
+   **Re-authentication required**. Repeat steps 2–3 there.
+
+Never paste codes, URLs containing `code=`, or `.storage` files into issues or chats.
+
+### 2. Find the entities
+
+Settings → Devices & services → Skylight Lists → your frame. Each list is
+`todo.<frame>_<list>` (for example `todo.home_grocery`). The attributes include
+`skylight_list_id` and `skylight_kind` (`shopping` or `to_do`). They also appear in the **To-do lists** sidebar.
+
+### 3. Test with a disposable Skylight list
+
+Create a list named e.g. `HA Test` in the Skylight app, wait up to 2 minutes (or reload the
+integration), then check each operation in both directions:
+
+| Step | In Home Assistant (To-do lists or Developer tools → Actions) | Expect in Skylight |
 |---|---|---|
-| `switch` | night light; one `<label> alarm` per alarm | The alarm switch enables or disables that alarm. Its attributes carry `time`, `rrule`, `fires_on`, `sound`, `volume` and `snoozable`. |
-| `number` | night light brightness, sleep sound volume; `<label> alarm volume` per alarm | |
-| `time` | `<label> alarm time` per alarm | Sent as `HH:MM`. |
-
-Alarms come from `/api/frames/{fid}/devices/{did}/alarms`. Alarms created in the app appear on the next frame poll. A Buddy's `wakes_at` / `sleeps_at` are separate from its alarms (they read `null` on a Buddy).
-
-### Sensor entities
-
-| Entity | Native value | Attributes |
-|---|---|---|
-| `sensor.<frame>_chores_today` | count | `chores[]` (id, summary, description, emoji, status, reward_points, start_date, start_time, completed_on, recurrence_rrule, routine, assignee_id, assignee) + `by_status` |
-| `sensor.<person>_chores_today` | count per family member | Same `chores[]` shape, filtered to that person |
-| `sensor.<frame>_meals_today` | count | `meals[]` (id, summary, category, recipe_title, recipe_description, note, recurrence_rrule, instances) + `by_slot` |
-| `sensor.<frame>_breakfast_today`<br>`sensor.<frame>_lunch_today`<br>`sensor.<frame>_dinner_today`<br>`sensor.<frame>_snack_today` | comma-joined meal names, or `"none"` | Full per-meal detail in `meals[]` |
-| `sensor.<person>_stars` | current star balance | Per family member |
-| `sensor.<frame>_task_box` | count | `items[]` — reusable chore templates the frame pulls from when adding an ad-hoc chore (summary, emoji, reward_points, routine) |
-| `image.<frame>_latest_photo` | most recent photo | Skylight scopes `/messages` to the authenticated user — you only see photos uploaded by the account HA authorized with, not photos from other family members using the same frame. |
-
----
-
-## Installation (HACS)
-
-1. HACS → Integrations → three-dot menu → **Custom repositories**
-2. Repository: `https://github.com/MegaTheLEGEND/skylight_calendar` — Category: **Integration**
-
-   [![Open your Home Assistant instance and open a repository inside HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=megathelegend&repository=skylight_calendar&category=integration)
-3. Search **Skylight** → Download → pick the latest release.
-4. Restart Home Assistant.
-5. Settings → Devices & Services → **Add Integration** → **Skylight**.
-6. Sign in through the browser popup when prompted.
-
-## Manual installation
-
-Copy `custom_components/skylight/` into `config/custom_components/skylight/` and restart HA.
-
-## Polling intervals
-
-Settings → Devices & Services → Skylight → **Configure** sets how often each kind of data is fetched, in seconds (30–7200):
-
-| Option | Default | Covers |
-|---|---|---|
-| Calendar | 300 | Calendar events and connected calendars |
-| Lists | 120 | Shopping and to-do lists |
-| Chores, meals and rewards | 300 | Chores, meal plans, star totals, task box |
-| Frame settings | 600 | Brightness, sleep schedule, other device settings |
-| Photos | 900 | Latest frame photo |
-
-Saving reloads the integration. Frame settings and connected-calendar lists are fetched conditionally (`If-None-Match`), so polling those more often costs little; chores, lists, rewards and photos always fetch in full, because Skylight's cache validators don't reliably move when those records change.
-
----
-
-## Reading item details in Lovelace
-
-Every sensor stashes the full record for each item in `extra_state_attributes`. Use a **Markdown card** with Jinja templates to render whatever detail you want — the same pattern works for chores, meals, task box, todo lists, and calendar events.
-
-Replace `slickfam` in every example below with your own frame name (whatever the sensor entity ID actually says — check Developer Tools → States if you're not sure).
-
-### Today's chores (whole family)
-
-```yaml
-type: markdown
-title: Today's chores
-content: |
-  {% for c in state_attr('sensor.slickfam_chores_today', 'chores') or [] %}
-  ### {{ c.emoji or '📋' }} {{ c.summary }}
-  {% if c.description %}> {{ c.description }}{% endif %}
-  - **Assigned to:** {{ c.assignee or 'Anyone' }}
-  - **Reward:** ⭐ {{ c.reward_points or 0 }}
-  - **Status:** {{ c.status }}{% if c.start_time %} · Due at {{ c.start_time }}{% endif %}
-  {% if c.recurrence_rrule %}- **Repeats:** `{{ c.recurrence_rrule }}`{% endif %}
-
-  {% endfor %}
-```
-
-### Today's chores (just one person)
-
-```yaml
-type: markdown
-title: Devin's chores today
-content: |
-  {% set chores = state_attr('sensor.devin_chores_today', 'chores') or [] %}
-  {% if chores | length == 0 %}
-  🎉 Nothing on your list today.
-  {% else %}
-  {% for c in chores %}
-  - {{ c.emoji or '☐' }} **{{ c.summary }}** {% if c.status == 'complete' %}✅{% endif %}
-    {% if c.reward_points %}⭐ {{ c.reward_points }}{% endif %}
-    {% if c.start_time %}· {{ c.start_time }}{% endif %}
-  {% endfor %}
-  {% endif %}
-```
-
-### Today's meals (all slots)
-
-```yaml
-type: markdown
-title: Today's meals
-content: |
-  {% for m in state_attr('sensor.slickfam_meals_today', 'meals') or [] %}
-  ### {{ m.category }} — {{ m.summary }}
-  {% if m.recipe_title and m.recipe_title != m.summary %}*Recipe:* **{{ m.recipe_title }}**{% endif %}
-  {% if m.recipe_description %}{{ m.recipe_description }}{% endif %}
-  {% if m.description %}{{ m.description }}{% endif %}
-  {% if m.note %}> Note: {{ m.note }}{% endif %}
-
-  {% endfor %}
-```
-
-### Per-slot meals (dashboard-friendly)
-
-The per-slot sensors expose the meal name as their state, so entity cards work directly:
-
-```yaml
-type: glance
-title: Today's menu
-entities:
-  - entity: sensor.slickfam_breakfast_today
-    name: Breakfast
-  - entity: sensor.slickfam_lunch_today
-    name: Lunch
-  - entity: sensor.slickfam_dinner_today
-    name: Dinner
-```
-
-For full detail on a single slot:
-
-```yaml
-type: markdown
-title: Dinner tonight
-content: |
-  {% for m in state_attr('sensor.slickfam_dinner_today', 'meals') or [] %}
-  ### {{ m.recipe_title or m.summary }}
-  {% if m.recipe_description %}{{ m.recipe_description }}{% endif %}
-  {% if m.note %}> {{ m.note }}{% endif %}
-  {% endfor %}
-```
-
-### Task box (reusable chore templates)
-
-```yaml
-type: markdown
-title: Task Box ({{ states('sensor.slickfam_task_box') }} templates)
-content: |
-  {% for t in state_attr('sensor.slickfam_task_box', 'items') or [] %}
-  - {{ t.emoji or '☐' }} **{{ t.summary }}**{% if t.reward_points %} · ⭐ {{ t.reward_points }}{% endif %}{% if t.routine %} · _routine_{% endif %}
-  {% endfor %}
-```
-
-### To-do / grocery lists
-
-The `todo` platform is best consumed via the native **Todo list** card, which supports adding, checking, and deleting items directly:
-
-```yaml
-type: todo-list
-entity: todo.grocery_list
-```
-
-For a read-only view alongside other data in the same dashboard, use a markdown template:
-
-```yaml
-type: markdown
-title: Grocery list
-content: |
-  {% for item in state_attr('todo.grocery_list', 'items') or [] %}
-  - {% if item.status == 'completed' %}~~{{ item.summary }}~~{% else %}☐ {{ item.summary }}{% endif %}
-  {% endfor %}
-```
-
-> **Note on todo detail:** Skylight list items only carry a `summary` label — there is no per-item description, due date, or reward points on Skylight's side. If you need richer item metadata (recurrence, points, assignment), use a chore instead.
-
-### Reward stars
-
-The star sensors have a numeric state that's already dashboard-friendly:
-
-```yaml
-type: glance
-title: Family stars
-entities:
-  - sensor.devin_stars
-  - sensor.tabi_stars
-  - sensor.logan_stars
-```
-
-### Calendar events
-
-Use the built-in Calendar card or a community card like `calendar-card-pro`:
-
-```yaml
-type: calendar
-entities:
-  - calendar.slickfam_calendar
-```
-
----
-
-## Automation examples
-
-**Announce chores at breakfast:**
-```yaml
-alias: Morning chores announcement
-trigger:
-  - platform: time
-    at: "07:30:00"
-action:
-  - service: tts.google_translate_say
-    data:
-      entity_id: media_player.kitchen_display
-      message: >
-        Good morning. Today's chores:
-        {% for c in state_attr('sensor.slickfam_chores_today', 'chores') %}
-        {{ c.assignee or 'Someone' }}: {{ c.summary }}.
-        {% endfor %}
-```
-
-**Notify when someone hits a star milestone:**
-```yaml
-alias: Star milestone
-trigger:
-  - platform: numeric_state
-    entity_id: sensor.logan_stars
-    above: 100
-action:
-  - service: notify.family
-    data:
-      message: "🎉 Logan just crossed 100 stars!"
-```
-
-**Dinner reminder with the actual dish name:**
-```yaml
-alias: Dinner reminder
-trigger:
-  - platform: time
-    at: "17:00:00"
-condition:
-  - condition: template
-    value_template: "{{ states('sensor.slickfam_dinner_today') != 'none' }}"
-action:
-  - service: notify.family
-    data:
-      message: "Dinner in one hour: {{ states('sensor.slickfam_dinner_today') }}"
-```
-
-**Auto-dim the frame at night:**
-```yaml
-alias: Skylight night dim
-trigger:
-  - platform: time
-    at: "21:00:00"
-action:
-  - service: number.set_value
-    target:
-      entity_id: number.slickfam_brightness
-    data:
-      value: 40
-```
-
----
-
-## Chores that repeat after completion
-
-`skylight.create_chore` accepts `renewal_interval` and `renewal_unit`
-(`day`, `week` or `month`) together. Skylight schedules the next chore from the
-actual completion date; Home Assistant does not maintain a second timer.
-For example, completing a 30-day chore late on 4 November makes its next due
-date 4 December, rather than retaining its original calendar date.
-
-```yaml
-action: skylight.create_chore
-data:
-  summary: Replace pre-filter
-  up_for_grabs: true
-  renewal_interval: 30
-  renewal_unit: day
-```
-
-`start` optionally sets the initial due date; omitted, it defaults to today.
-Existing chores are not modified. Omit both renewal fields for existing create
-behavior. Do not combine renewal with `recurrence_set` or `recurring_until`.
-
----
-
-## Uploading photos & videos
-
-The integration exposes a `skylight.upload_media` service that pushes an image or short video to your frame — same path the mobile app uses (temp AWS credentials → SigV4-signed PUT to S3 → notification to Skylight).
-
-**Supported formats:** jpg, jpeg, png, gif, heic, heif, webp, mp4, mov, m4v.
-
-**Path requirements:** The file must be readable by Home Assistant. Anything under `/config` works, or add the parent directory to `homeassistant.allowlist_external_dirs` in `configuration.yaml`.
-
-```yaml
-service: skylight.upload_media
-data:
-  file_path: /config/www/family_photo.jpg
-  caption: "Sunday brunch"      # optional
-  frame_id: "5377413"           # optional, only needed with multiple frames
-```
-
-**Automation example — send a snapshot from a doorbell trigger:**
-
-```yaml
-alias: Doorbell → Skylight
-trigger:
-  - platform: state
-    entity_id: binary_sensor.front_door
-    to: "on"
-action:
-  - service: camera.snapshot
-    target:
-      entity_id: camera.front_door
-    data:
-      filename: "/config/www/skylight_doorbell.jpg"
-  - service: skylight.upload_media
-    data:
-      file_path: "/config/www/skylight_doorbell.jpg"
-      caption: "Someone at the door!"
-```
-
-**Caveat on captions:** Free Skylight accounts have captions server-side-disabled (`plus_gated_content.captions = false`). The caption field is still sent, but the frame ignores it. Skylight Plus subscribers get real caption display.
-
-After a successful upload the `image.<frame>_latest_photo` entity refreshes within a few seconds (the service kicks the photos coordinator immediately instead of waiting for the next 30s poll).
-
----
-
-## Services
-
-Every service takes an optional `frame_id`, which is only required when you have more than one frame configured. Each one refreshes the relevant coordinator on success, so entities catch up immediately instead of waiting for the next poll.
-
-| Service | What it does |
+| Add | `todo.add_item` item `Test milk` | Item appears |
+| Complete | Tick the item | Item shows completed |
+| Un-complete | Un-tick it | Item open again |
+| Rename | Edit name to `Test oat milk` | Name changes |
+| Delete | Delete the item | Item gone |
+| Reverse | Add, tick, rename, delete an item in the Skylight app | HA shows each change within 2 minutes |
+
+If **rename** fails with `HTTP 422` or silently does nothing, or **delete** reports
+`Skylight did not delete`, stop. Please open an issue with only the error text. The rest of the integration
+is still usable, but do not enable sync until it is fixed.
+
+## Two-way sync with Alexa
+
+Use **[To-do List Sync](https://github.com/skornehl/ha-todo-sync)** (`todo_sync`, v0.1.3 reviewed).
+It only calls Home Assistant `todo.*` actions: no network access, no dependencies, MIT licence.
+It was reviewed for this use, and its merge logic was exercised against Alexa/Skylight scenarios:
+
+- One config entry per pair, so **multiple independent pairs** work (Alexa Shopping ↔ Skylight
+  Grocery, Alexa Costco ↔ Skylight Costco). The same pair cannot be added twice.
+- Items are matched by name (case/whitespace-insensitive). A snapshot of the last sync
+  distinguishes "added on one side" from "deleted on the other" to prevent loops and re-adds.
+- **The first sync only adds**: each item missing on one side is copied over. Nothing is deleted or completed.
+  Items that are completed only in Skylight are not copied to Alexa.
+- **List A is the side that drops checked items (Alexa).** An item disappearing from Alexa is
+  treated as checked off, and is completed (not deleted) in Skylight.
+- Skips a sync entirely if either list is `unavailable`. That is why this integration
+  fails closed instead of reporting an empty list.
+- An item must be missing for 6 minutes before its absence is acted on. A sync that would remove
+  or check off more than half of the items (minimum 5) is refused.
+- Saying "Alexa, add milk" while Skylight still has a completed `Milk` re-opens that item
+  instead of adding a duplicate.
+
+Known limits: there is **no dry-run mode**. A rename is synced as "add new name, then check off the old name"
+after the 6-minute window. On lists with fewer than 5 items the mass-change guard does not apply.
+Alexa normal voice usage is untouched: the Alexa integration keeps using Amazon's real list.
+
+### Mapping
+
+| Change | Result |
 |---|---|
-| `skylight.upload_media` | Push a photo or short video to the frame (see above). |
-| `skylight.create_chore` | Add a chore to the chore chart, assigned to one or more family members (required). Skylight creates one chore per assignee. |
-| `skylight.create_task` | Add an unscheduled item to the Task Box for the frame to assign to a day later. |
-| `skylight.create_list` | Create a new shopping or to-do list. |
-| `skylight.delete_list` | Permanently delete a list and its items. |
-| `skylight.create_reward` | Add a reward redeemable with earned stars. Skylight stores one reward per family member, so this creates one per ID given. |
-| `skylight.redeem_reward` | Spend a family member's stars on a reward. |
-| `skylight.create_recipe` | Add a recipe to the meal planner. |
-| `skylight.plan_meal` | Schedule a meal into a slot on a given day. |
-| `skylight.add_recipe_to_grocery_list` | Push a recipe's ingredients onto the default grocery list. |
+| "Alexa, add milk" | `Milk` added to Skylight (≈ Alexa poll + 10 s) |
+| Added in Skylight | Added to Alexa (≤ 2 min Skylight poll + 10 s) |
+| Checked in Skylight | Checked (removed) in Alexa |
+| Checked/removed in Alexa | Completed in Skylight after 6–10 min |
+| Un-checked in Skylight | Added to Alexa again |
+| Deleted in Skylight | Removed from Alexa |
+| Renamed on either side | New name added, old name checked off (after confirm window) |
 
-**Finding IDs.** The `category_id` for a family member, `meal_category_id` for a meal slot, and `recipe_id` all come off the sensor attributes documented above — for example `sensor.<frame>_chores_today` exposes `assignee_id` per chore, and `sensor.<frame>_meals_today` exposes the recipe and slot for each planned meal. A list's `list_id` is the trailing segment of the matching todo entity's unique ID.
+### Setup
 
-```yaml
-# Assign Saturday's bin duty — one chore each for two family members
-service: skylight.create_chore
-data:
-  summary: Take out the bins
-  start: "2026-09-05"
-  start_time: "17:30:00"
-  assignees: ["Robbie", "Josh"]   # or category_ids: ["23469502"]
-  description: Green bin this week
-```
-
-Names are matched case-insensitively against the frame's profiles, and only against real people — a frame's category list also contains calendar buckets like `US Holidays` or `Robbie's Calendar`, and those are rejected rather than silently assigned. An unknown name lists the valid ones back at you.
-
-```yaml
-# Plan Tuesday dinner and send the ingredients to the grocery list
-- service: skylight.plan_meal
-  data:
-    date: "2026-09-01"
-    meal_category_id: "9115872"
-    recipe_id: "1234567"
-- service: skylight.add_recipe_to_grocery_list
-  data:
-    recipe_id: "1234567"
-```
-
-**Creating calendar events** uses the standard HA `calendar.create_event` service against the aggregate `calendar.<frame>_calendar` entity. Skylight puts events with no explicit calendar target on whichever source calendar is flagged `default_for_new_events`. Editing and deleting work against any source calendar Skylight reports as writable; read-only subscriptions (holiday feeds, `webcal` imports like a council rubbish schedule) don't advertise those features at all.
-
-```yaml
-service: calendar.create_event
-target:
-  entity_id: calendar.skylight_frame_calendar
-data:
-  summary: Dentist
-  start_date_time: "2026-09-01 14:00:00"
-  end_date_time: "2026-09-01 15:00:00"
-  location: Dr Smith's office
-```
-
----
-
-## Authentication
-
-The config flow runs a normal OAuth2 authorization-code + PKCE grant. You'll be redirected to Skylight's sign-in page, log in with your Skylight credentials, and consent — HA takes it from there and stores the refresh token. On 401s it rotates automatically and persists the new pair back to the config entry. You should never need to redo this unless you revoke the grant server-side.
-
-### Adding a second frame
-
-Each frame gets its own HA config entry. Run **Add Integration → Skylight** again — the picker step lists frames not already configured.
-
----
+1. **Back up** Home Assistant (Settings → System → Backups → Create backup).
+2. **Record both lists.** In Developer tools → Actions, run `todo.get_items` for the Alexa
+   list and the Skylight list with `status: [needs_action, completed]`, and save the responses.
+   This is your preview of what the first sync will merge, and your restore source.
+3. HACS → Custom repositories → `https://github.com/skornehl/ha-todo-sync` (Integration) →
+   download **To-do List Sync** (pin v0.1.3) → restart.
+4. **Test pair first.** Pair a throwaway Alexa list (if your Alexa integration exposes custom
+   lists) with the `HA Test` Skylight list. Settings → Devices & services → Add integration →
+   **To-do List Sync**: **List A = the Alexa entity**, **List B = the Skylight entity**.
+   Run through the mapping table above, allowing up to 10 minutes per absence-based step.
+5. **Real pairs.** Add one entry per pair, always Alexa as A, e.g.
+   `todo.alexa_shopping_list` ↔ `todo.home_grocery`. Use the entity ids you see under
+   Settings → Entities (filter by `todo.`). After the first sync, compare both lists with your
+   step-2 records: only additions should have happened.
 
 ## Troubleshooting
 
-Enable debug logging:
+- **Sync status:** each pair has a `sensor.<pair>_last_sync` entity. Its `last_error` and `last_changes`
+  attributes say what happened. "is not available" means one list was `unavailable`, and sync skipped safely.
+- **Skylight entity unavailable:** check Settings → System → Logs for `custom_components.skylight`.
+  `HTTP 5xx`, `timed out` or `Could not contact` are Skylight/network outages and recover by themselves.
+  `omitted some requested list items` / `paginated` mean Skylight changed its response format. Open an issue.
+- **Re-authentication required:** the refresh token was rejected. Re-authenticate from the notification.
+- **Mass-change refused:** if you really cleared a list, run `todo_sync.sync_now` with `force: true`.
+- **Debug logging:** add the following to `configuration.yaml` temporarily (no secrets are logged):
 
-```yaml
-logger:
-  default: info
-  logs:
-    custom_components.skylight: debug
+  ```yaml
+  logger:
+    logs:
+      custom_components.skylight: debug
+      custom_components.todo_sync: debug
+  ```
+
+## Disable, roll back, update
+
+- **Pause sync:** Settings → Devices & services → To-do List Sync → the pair → ⋮ → **Disable**.
+  Lists stop changing immediately. Re-enabling resumes from the stored snapshot.
+- **Restore items:** re-add anything lost from the `todo.get_items` records from setup step 2, or restore the backup.
+- **Roll back this integration:** HACS → Skylight Lists → ⋮ → **Redownload** → choose the previous
+  version, restart. Disable sync first.
+- **Update safely:** disable sync pairs, update, restart, confirm the Skylight entities load
+  and the disposable-list test still passes, then re-enable sync. Review upstream changes
+  individually; do not blindly replace this fork with upstream.
+
+## Continuous operation (Windows-hosted HA OS VM)
+
+- Set the VM to **start automatically** with the host (Hyper-V: *Automatic Start Action*;
+  VirtualBox/VMware: autostart), and give it an *Automatic Stop Action* of **Shut down**/**Save**
+  so Windows Update reboots don't corrupt it.
+- Disable sleep/hibernate on the Windows host. A suspended VM stops syncing, and its clock may drift.
+- Keep the VM clock synced (HA OS uses NTP). Token expiry depends on correct time.
+- Schedule regular Home Assistant backups and store them off the host, since they contain the Skylight tokens.
+- Nothing needs inbound network access. Both integrations poll outbound only.
+
+## Future: Apple Reminders
+
+Not part of this release. Possible paths, in order of practicality:
+
+1. **iOS Shortcuts automation** that calls `todo.add_item` / `todo.update_item` on the
+   Skylight entity via Home Assistant's companion app. One-way, but robust.
+2. **CalDAV** (Home Assistant's CalDAV integration exposes VTODO lists as `todo` entities).
+   iCloud no longer serves upgraded Reminders lists over CalDAV, so this only works with a
+   CalDAV server you control or legacy lists.
+
+Either path would give a third `todo` entity that To-do List Sync can pair with the Skylight list.
+
+## Development
+
+```sh
+python3.14 -m venv .venv && .venv/bin/pip install -r requirements_test.txt
+.venv/bin/ruff check . && .venv/bin/pytest -q
 ```
 
-| Symptom | Cause / fix |
-|---|---|
-| Auth fails on config flow | Try a different browser / clear Skylight cookies. |
-| Calendar entity has no events | Verify events exist in the ±14 / +60 day window on your frame. |
-| Todo entities missing after adding a new list on the frame | Reload the integration to force a refresh, or wait for the 2-minute polling interval. |
-| Star sensors missing for a profile | The profile must have `linked_to_profile=true` on its category — ensure the profile is fully set up on the frame. |
-| `Task box` sensor shows 0 | Task box only surfaces user-added reusable chores; if your frame doesn't use the task-box feature this is expected. |
-
----
-
-## What changed in v2.1.0
-
-- Full platform coverage: per-source calendars, per-family-member chore sensors, per-slot meal sensors, `image` / `switch` / `number` platforms for frame device controls, reconfigure flow.
-- OAuth2 rewritten to proper authorization-code + PKCE — no more manual DevTools token capture.
-- Correct routing of brightness / slideshow_speed / sleep_mode through the device endpoint (not the frame endpoint).
-
-## What changed in v2.0.0
-
-- Full rewrite around Skylight's OAuth2 API (Bearer + `Skylight-Api-Version: 2026-05-01`).
-- New `todo` and `sensor` platforms.
-- Automatic refresh-token rotation persisted to the config entry.
-- Discovered / corrected several API-shape mismatches vs. older reverse-engineered notes (lists use `attributes.label`, chores use `after`/`before`, reward points is a flat list).
-
----
-
-## Credits
-
-[MegaTheLEGEND/skylight_calendar](https://github.com/MegaTheLEGEND/skylight_calendar). OAuth2 rewrite + platform expansion by [@devinslick](https://github.com/devinslick). (Thank you so much!)
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+Tests run Home Assistant 2026.10 (via `pytest-homeassistant-custom-component`) against an
+in-memory model of the Skylight list API (`tests/conftest.py`). They cover auth/refresh,
+item CRUD, outages and partial reads, and log/secret hygiene.
+`scripts/ha_core_smoke.py` boots a real Home Assistant 2026.11.1 core with the same fake
+(config flow, every todo action, outage, unload; real network calls are blocked).
+CI runs both, plus hassfest and HACS validation.

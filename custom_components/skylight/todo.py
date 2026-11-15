@@ -1,9 +1,9 @@
-"""Todo platform: HA Todo entities per Skylight list AND per family member's chore queue."""
+"""Expose each Skylight list as a Home Assistant to-do entity."""
 
 from __future__ import annotations
 
-import logging
-from datetime import date, datetime
+from collections.abc import Callable, Coroutine
+from typing import Any
 
 from homeassistant.components.todo import (
     TodoItem,
@@ -11,146 +11,55 @@ from homeassistant.components.todo import (
     TodoListEntity,
     TodoListEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
-from homeassistant.util import dt as dt_util
 
-from .api import SkylightAPI
-from .const import CHORE_COMPLETE_STATUSES, DOMAIN
-from .coordinator import SkylightListsCoordinator, SkylightSensorCoordinator
-
-_LOGGER = logging.getLogger(__name__)
+from . import SkylightConfigEntry
+from .api import SkylightAPI, SkylightAPIError
+from .const import DOMAIN, ITEM_STATUS_COMPLETED, ITEM_STATUS_PENDING
+from .coordinator import SkylightListsCoordinator, fetch_list_items, parse_item
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: SkylightConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    data = hass.data[DOMAIN][entry.entry_id]
-    lists_coord: SkylightListsCoordinator = data["lists_coordinator"]
-    sensor_coord: SkylightSensorCoordinator = data["sensor_coordinator"]
-    api: SkylightAPI = data["api"]
-    frame_id: str = data["frame_id"]
-    frame_name: str = data["frame_name"]
-
-    entities: list[TodoListEntity] = []
-
-    # 1) One entity per Skylight list.
-    for list_id, list_data in (lists_coord.data or {}).items():
-        entities.append(
-            SkylightTodoList(
-                lists_coord, api, frame_id, frame_name, list_id, list_data["name"]
-            )
-        )
-
-    # 2) One entity per family member: their chore queue (completeable from HA).
-    for cat_id, label in _profile_categories(sensor_coord.data or {}):
-        entities.append(
-            SkylightMemberChoreTodo(
-                sensor_coord, api, frame_id, frame_name, cat_id, label
-            )
-        )
-
-    async_add_entities(entities)
-
-    known_lists: set[str] = {
-        e.list_id for e in entities if isinstance(e, SkylightTodoList)
-    }
+    data = entry.runtime_data
+    coordinator = data.coordinator
+    known: set[str] = set()
 
     @callback
-    def _handle_lists_update() -> None:
-        current = set((lists_coord.data or {}).keys())
-        new_ids = current - known_lists
-        if not new_ids:
-            return
-        new_entities = []
-        for lid in new_ids:
-            ldata = lists_coord.data[lid]
-            new_entities.append(
+    def _add_new_lists() -> None:
+        created = []
+        for list_id, list_data in (coordinator.data or {}).items():
+            if list_id in known:
+                continue
+            known.add(list_id)
+            created.append(
                 SkylightTodoList(
-                    lists_coord, api, frame_id, frame_name, lid, ldata["name"]
+                    coordinator,
+                    data.api,
+                    data.frame_id,
+                    data.frame_name,
+                    list_id,
+                    list_data["name"],
                 )
             )
-            known_lists.add(lid)
-        if new_entities:
-            async_add_entities(new_entities)
+        if created:
+            async_add_entities(created)
 
-    entry.async_on_unload(lists_coord.async_add_listener(_handle_lists_update))
-
-
-def _profile_categories(data: dict) -> list[tuple[str, str]]:
-    cats = (data.get("categories") or {}).get("data", [])
-    out: list[tuple[str, str]] = []
-    for c in cats:
-        attrs = c.get("attributes", {})
-        if not attrs.get("linked_to_profile"):
-            continue
-        label = attrs.get("label", "")
-        if "@" in label:
-            continue
-        out.append((str(c.get("id")), label))
-    return out
+    _add_new_lists()
+    entry.async_on_unload(coordinator.async_add_listener(_add_new_lists))
 
 
-def _list_item_status(status: TodoItemStatus | None) -> str:
-    """HA todo status → the ``pending``/``completed`` a *list item* uses.
-
-    Deliberately not shared with chores: a chore's finished state is the literal
-    ``complete``, and it's set through a separate endpoint rather than as a
-    field. Merging the two is what made ticking a chore silently do nothing.
-    """
-    return "completed" if status == TodoItemStatus.COMPLETED else "pending"
-
-
-def _chore_is_complete(attrs: dict) -> bool:
-    """Whether a chore counts as done.
-
-    Checks the completion timestamps as well as ``status`` on purpose. A filled
-    ``completed_on`` / ``completed_at`` is unambiguous, and it covers the case
-    where the chore *list* feed represents completion differently from the
-    completions response — recurring chores expand into per-occurrence records
-    (note the ``group``/``series`` fields), so an occurrence may well carry the
-    date without the parent's status changing.
-    """
-    if str(attrs.get("status") or "") in CHORE_COMPLETE_STATUSES:
-        return True
-    return bool(attrs.get("completed_on") or attrs.get("completed_at"))
-
-
-def _split_chore_uid(uid: str) -> tuple[str, str | None]:
-    """Chore uid → its ``(series_id, occurrence_date)``.
-
-    A recurring chore is listed once per occurrence under a composite id —
-    ``101940933-2026-08-28`` — while one-off chores keep the bare series number.
-    Every chore route is keyed on the series id alone, so the composite form has
-    to be taken apart before it can be put in a URL; the date half is what
-    ``instance_date`` wants.
-    """
-    series, sep, suffix = uid.partition("-")
-    if sep and series.isdigit():
-        try:
-            return series, date.fromisoformat(suffix).isoformat()
-        except ValueError:
-            pass
-    return uid, None
-
-
-def _chore_start(due: date | datetime | None) -> str:
-    """Map a HA due date onto a chore's ``start``.
-
-    Skylight chores are day-scoped, so a due *datetime* loses its time component.
-    An item with no due date lands on today, matching what the frame does when a
-    chore is added from its touchscreen.
-    """
-    if isinstance(due, datetime):
-        return due.date().isoformat()
-    if isinstance(due, date):
-        return due.isoformat()
-    return dt_util.now().date().isoformat()
+def _skylight_status(status: TodoItemStatus) -> str:
+    if status == TodoItemStatus.COMPLETED:
+        return ITEM_STATUS_COMPLETED
+    return ITEM_STATUS_PENDING
 
 
 class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEntity):
@@ -173,7 +82,7 @@ class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEnti
         super().__init__(coordinator)
         self._api = api
         self._frame_id = frame_id
-        self.list_id = list_id
+        self._list_id = list_id
         self._attr_name = list_name
         self._attr_unique_id = f"skylight_{frame_id}_list_{list_id}"
         self._attr_device_info = DeviceInfo(
@@ -183,197 +92,157 @@ class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEnti
             model="Calendar Frame",
         )
 
+    def _list_data(self) -> dict[str, Any] | None:
+        return (self.coordinator.data or {}).get(self._list_id)
+
+    @property
+    def available(self) -> bool:
+        # A list deleted in Skylight must not look like an empty list.
+        return super().available and self._list_data() is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self._list_data() or {}
+        return {"skylight_list_id": self._list_id, "skylight_kind": data.get("kind")}
+
     @property
     def todo_items(self) -> list[TodoItem] | None:
-        list_data = (self.coordinator.data or {}).get(self.list_id)
-        if list_data is None:
+        data = self._list_data()
+        if data is None:
             return None
-        items: list[TodoItem] = []
-        for it in list_data["items"]:
-            status = (
-                TodoItemStatus.COMPLETED
-                if it["status"] == "completed"
-                else TodoItemStatus.NEEDS_ACTION
+        return [
+            TodoItem(
+                summary=item["name"],
+                uid=item["id"],
+                status=(
+                    TodoItemStatus.COMPLETED
+                    if item["status"] == ITEM_STATUS_COMPLETED
+                    else TodoItemStatus.NEEDS_ACTION
+                ),
             )
-            items.append(TodoItem(summary=it["name"], uid=it["id"], status=status))
-        return items
+            for item in data["items"]
+        ]
+
+    def _current_item(self, uid: str) -> dict[str, Any] | None:
+        for item in (self._list_data() or {}).get("items", []):
+            if item["id"] == uid:
+                return item
+        return None
+
+    async def _call(self, func: Callable[..., Coroutine[Any, Any, Any]], *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await func(*args, **kwargs)
+        except SkylightAPIError as err:
+            raise HomeAssistantError(str(err)) from None
 
     async def async_create_todo_item(self, item: TodoItem) -> None:
-        await self._api.add_list_item(self._frame_id, self.list_id, item.summary or "")
-        await self.coordinator.async_request_refresh()
-
-    async def async_update_todo_item(self, item: TodoItem) -> None:
-        attrs: dict = {}
-        if item.summary is not None:
-            attrs["name"] = item.summary
-        if item.status is not None:
-            attrs["status"] = _list_item_status(item.status)
-        if attrs and item.uid:
-            await self._api.update_list_item(
-                self._frame_id, self.list_id, item.uid, attrs
-            )
-            await self.coordinator.async_request_refresh()
-
-    async def async_delete_todo_items(self, uids: list[str]) -> None:
-        for uid in uids:
-            await self._api.delete_list_item(self._frame_id, self.list_id, uid)
-        await self.coordinator.async_request_refresh()
-
-
-class SkylightMemberChoreTodo(
-    CoordinatorEntity[SkylightSensorCoordinator], TodoListEntity
-):
-    """A single family member's chore queue as a HA Todo entity.
-
-    Full CRUD: chores created here are assigned to this member's category, and
-    completing one round-trips to the frame plus the rewards ledger. A chore's
-    due date maps onto its ``start`` day.
-    """
-
-    _attr_has_entity_name = True
-    _attr_supported_features = (
-        TodoListEntityFeature.CREATE_TODO_ITEM
-        | TodoListEntityFeature.UPDATE_TODO_ITEM
-        | TodoListEntityFeature.DELETE_TODO_ITEM
-        | TodoListEntityFeature.SET_DUE_DATE_ON_ITEM
-        | TodoListEntityFeature.SET_DESCRIPTION_ON_ITEM
-    )
-
-    def __init__(
-        self,
-        coordinator: SkylightSensorCoordinator,
-        api: SkylightAPI,
-        frame_id: str,
-        frame_name: str,
-        category_id: str,
-        label: str,
-    ) -> None:
-        super().__init__(coordinator)
-        self._api = api
-        self._frame_id = frame_id
-        self._category_id = str(category_id)
-        self._attr_name = f"{label} chores"
-        self._attr_unique_id = f"skylight_{frame_id}_chore_todo_{category_id}"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, frame_id)},
-            name=frame_name,
-            manufacturer="Skylight",
-            model="Calendar Frame",
+        label = (item.summary or "").strip()
+        if not label:
+            raise ServiceValidationError("A Skylight list item needs a name")
+        response = await self._call(
+            self._api.add_list_item, self._frame_id, self._list_id, label
         )
-
-    def _member_chores(self) -> list[dict]:
-        raw = (self.coordinator.data or {}).get("chores")
-        if raw is None:
-            return []
-        entries = raw if isinstance(raw, list) else raw.get("data", []) or []
-        out = []
-        for c in entries:
-            rel = (c.get("relationships", {}) or {}).get("category", {}) or {}
-            data = rel.get("data") or {}
-            assignee = str(data.get("id") or c.get("attributes", {}).get("category_id") or "")
-            if assignee == self._category_id:
-                out.append(c)
-        return out
-
-    @property
-    def todo_items(self) -> list[TodoItem] | None:
-        result: list[TodoItem] = []
-        for c in self._member_chores():
-            attrs = c.get("attributes", {}) if isinstance(c, dict) else {}
-            summary = attrs.get("summary") or attrs.get("name") or "Chore"
-            status = (
-                TodoItemStatus.COMPLETED
-                if _chore_is_complete(attrs)
-                else TodoItemStatus.NEEDS_ACTION
-            )
-            uid = str(c.get("id"))
-            due_raw = (
-                attrs.get("start")
-                or attrs.get("date")
-                or attrs.get("due_date")
-                or ""
-            )
-            due: date | datetime | None = None
-            if isinstance(due_raw, str) and len(due_raw) >= 10:
-                try:
-                    due = date.fromisoformat(due_raw[:10])
-                except ValueError:
-                    due = None
-            result.append(
-                TodoItem(
-                    summary=summary,
-                    uid=uid,
-                    status=status,
-                    due=due,
-                    description=attrs.get("description") or None,
-                )
-            )
-        return result
-
-    async def async_create_todo_item(self, item: TodoItem) -> None:
-        # Skylight's create route takes no status, so a new chore always starts
-        # pending — completing it is a second call the user makes from the list.
-        await self._api.create_chores(
-            self._frame_id,
-            summary=item.summary or "Chore",
-            start=_chore_start(item.due),
-            category_ids=[self._category_id],
-            description=item.description,
-        )
+        record = response.get("data") if isinstance(response, dict) else None
+        try:
+            created = parse_item(record) if isinstance(record, dict) else None
+        except SkylightAPIError:
+            created = None
+        if created is not None:
+            items = (self._list_data() or {}).get("items", [])
+            if all(existing["id"] != created["id"] for existing in items):
+                self._set_items([*items, created])
         await self.coordinator.async_request_refresh()
-
-    def _chore_attributes(self, uid: str) -> dict:
-        for c in self._member_chores():
-            if str(c.get("id")) == str(uid):
-                return c.get("attributes", {}) or {}
-        return {}
 
     async def async_update_todo_item(self, item: TodoItem) -> None:
         if not item.uid:
-            return
-
-        chore_id, occurrence = _split_chore_uid(item.uid)
-        attrs = self._chore_attributes(item.uid)
-
-        attributes: dict = {}
+            raise ServiceValidationError("The Skylight list item has no id")
+        current = self._current_item(item.uid)
+        label: str | None = None
+        status: str | None = None
         if item.summary is not None:
-            attributes["summary"] = item.summary
-        if item.due is not None:
-            attributes["start"] = _chore_start(item.due)
-        if item.description is not None:
-            attributes["description"] = item.description
-        if attributes:
-            await self._api.update_chore(self._frame_id, chore_id, attributes)
-
-        # Completion lives on its own sub-resource, so only touch it when the
-        # tick actually changed: HA re-sends the whole item on any edit, and
-        # clearing an already-incomplete chore isn't necessarily a no-op.
+            label = item.summary.strip()
+            if not label:
+                raise ServiceValidationError("A Skylight list item needs a name")
+            if current is not None and current["name"] == label:
+                label = None
         if item.status is not None:
-            want_complete = item.status == TodoItemStatus.COMPLETED
-            if want_complete != _chore_is_complete(attrs):
-                # Which occurrence is being ticked: the composite UID date, or
-                # None for bare-UID chores. The API requires instance_date to be
-                # absent for bare-UID chores even when start is set — the
-                # composite UID format is the sole signal that instance_date is
-                # needed.
-                instance_date = occurrence
-                if want_complete:
-                    # The frame files completions by calendar day, so use HA's
-                    # local date rather than UTC.
-                    await self._api.complete_chore(
-                        self._frame_id,
-                        chore_id,
-                        dt_util.now().date().isoformat(),
-                        instance_date,
-                    )
-                else:
-                    await self._api.uncomplete_chore(
-                        self._frame_id, chore_id, instance_date
-                    )
-
+            status = _skylight_status(item.status)
+            if current is not None and current["status"] == status:
+                status = None
+        if label is None and status is None:
+            return
+        await self._call(
+            self._api.update_list_item,
+            self._frame_id,
+            self._list_id,
+            item.uid,
+            label=label,
+            status=status,
+        )
+        # Writes inside the refresh cooldown compare against this copy, so it
+        # must reflect the accepted change before the refresh lands.
+        changes = {"name": label, "status": status}
+        self._set_items(
+            [
+                {**it, **{k: v for k, v in changes.items() if v is not None}}
+                if it["id"] == item.uid
+                else it
+                for it in (self._list_data() or {}).get("items", [])
+            ]
+        )
         await self.coordinator.async_request_refresh()
 
     async def async_delete_todo_items(self, uids: list[str]) -> None:
-        for uid in uids:
-            await self._api.delete_chore(self._frame_id, _split_chore_uid(uid)[0])
-        await self.coordinator.async_request_refresh()
+        uids = list(dict.fromkeys(uids))
+        verified: list[dict[str, Any]] | None = None
+        try:
+            for uid in uids:
+                await self._call(
+                    self._api.delete_list_item, self._frame_id, self._list_id, uid
+                )
+            items = await self._verified_items()
+            remaining = _present(items, uids)
+            if remaining:
+                # Some clients report single-item DELETE as accepted but ignored;
+                # the web app's bulk endpoint is the fallback.
+                await self._call(
+                    self._api.bulk_delete_list_items,
+                    self._frame_id,
+                    self._list_id,
+                    remaining,
+                )
+                items = await self._verified_items()
+                remaining = _present(items, uids)
+            verified = items
+            if remaining:
+                raise HomeAssistantError(
+                    f"Skylight did not delete {len(remaining)} list item(s)"
+                )
+        finally:
+            if verified is None or not self._set_items(verified):
+                await self.coordinator.async_request_refresh()
+
+    async def _verified_items(self) -> list[dict[str, Any]]:
+        """A fresh read of this list; raises, because an unverified delete
+        must never count as done."""
+        try:
+            return await fetch_list_items(self._api, self._frame_id, self._list_id)
+        except SkylightAPIError as err:
+            raise HomeAssistantError(
+                f"Could not confirm the Skylight deletion: {err}"
+            ) from None
+
+    def _set_items(self, items: list[dict[str, Any]]) -> bool:
+        """Show this list's known state now instead of after the refresh cooldown."""
+        data = self.coordinator.data
+        if not self.coordinator.last_update_success or not data or self._list_id not in data:
+            return False
+        self.coordinator.async_set_updated_data(
+            {**data, self._list_id: {**data[self._list_id], "items": items}}
+        )
+        return True
+
+
+def _present(items: list[dict[str, Any]], uids: list[str]) -> list[str]:
+    ids = {item["id"] for item in items}
+    return [uid for uid in uids if uid in ids]
