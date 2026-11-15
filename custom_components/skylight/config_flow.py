@@ -75,7 +75,6 @@ def _authorize_url(challenge: str) -> str:
             "redirect_uri": OAUTH_REDIRECT_URI,
             "code_challenge": challenge,
             "code_challenge_method": "S256",
-            "prompt": "login",
         }
     )
     return f"{OAUTH_AUTHORIZE_URL}?{qs}"

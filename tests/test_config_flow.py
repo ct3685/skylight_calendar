@@ -28,6 +28,8 @@ async def test_sign_in_creates_entry(hass: HomeAssistant, skylight: FakeSkylight
     url = result["description_placeholders"]["auth_url"]
     assert url.startswith("https://app.ourskylight.com/oauth/authorize?")
     assert "code_challenge_method=S256" in url
+    # No forced login, so an existing Skylight browser session can skip the form.
+    assert "prompt=" not in url
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {"code": CALLBACK})
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "Test Home"
@@ -66,6 +68,7 @@ async def test_reauth_updates_tokens(hass: HomeAssistant, skylight: FakeSkylight
     entry.add_to_hass(hass)
     result = await entry.start_reauth_flow(hass)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {"code": "good-code"})
+    await hass.async_block_till_done()
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
     assert entry.data[CONF_ACCESS_TOKEN] == skylight.access_token

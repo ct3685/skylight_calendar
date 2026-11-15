@@ -1,4 +1,4 @@
-# Skylight Lists — reviewed personal fork
+# Skylight (ToDo Lists Only)
 
 **Experimental, unofficial Home Assistant integration for Skylight shopping/to-do lists only.**
 It exposes each Skylight list as a Home Assistant `todo` entity so a sync engine can pair it
@@ -73,23 +73,31 @@ before you connect a household list.
 ## Installation (Home Assistant Marketplace / HACS)
 
 1. HACS → ⋮ → **Custom repositories** → add `https://github.com/ct3685/skylight_calendar`, type **Integration**.
-2. Open **Skylight Lists (Reviewed Fork)** → **Download** → restart Home Assistant.
+2. Open **Skylight (ToDo Lists Only)** → **Download** → restart Home Assistant.
 3. This integration uses the domain `skylight`. Do not install another Skylight integration at the same time.
 
 ### 1. Authenticate
 
-1. Settings → Devices & services → **Add integration** → **Skylight Lists**.
-2. Click **Open Skylight sign-in**, sign in, and wait for the redirect to `ourskylight.com/welcome?code=…`.
-3. Copy the whole URL (or only the `code` value) into the form within about 30 seconds. Codes are single-use.
-4. If the account has several frames, pick the one with your lists.
-5. When tokens are later rejected (password change, revoked session), Home Assistant shows
-   **Re-authentication required**. Repeat steps 2–3 there.
+Skylight only redirects its OAuth client to its own web app (`ourskylight.com/welcome`),
+which immediately navigates away, so the code has to be captured from the browser's network log.
+
+1. Settings → Devices & services → **Add integration** → **Skylight (ToDo Lists Only)**. Keep this dialog open.
+2. In a new browser tab, press F12 → **Network** → tick **Preserve log**.
+3. In that tab, open the **Skylight sign-in** link from the dialog and sign in. If the browser
+   is already signed in to Skylight, the login form may be skipped. Check it is the right account.
+4. Skylight's page redirects a few times. Type `code=` in the Network filter and copy the first
+   `ourskylight.com/welcome?code=…` URL (right-click → Copy → Copy URL).
+5. Paste the whole URL (or only the code) into the dialog and submit straight away. Codes are single-use.
+   If a code is rejected, open the same dialog link again. It stays valid until the dialog closes.
+6. If the account has several frames, pick the one with your lists.
+7. When tokens are later rejected (password change, revoked session), Home Assistant shows
+   **Re-authentication required**. Repeat steps 2–5 there.
 
 Never paste codes, URLs containing `code=`, or `.storage` files into issues or chats.
 
 ### 2. Find the entities
 
-Settings → Devices & services → Skylight Lists → your frame. Each list is
+Settings → Devices & services → Skylight (ToDo Lists Only) → your frame. Each list is
 `todo.<frame>_<list>` (for example `todo.home_grocery`). The attributes include
 `skylight_list_id` and `skylight_kind` (`shopping` or `to_do`). They also appear in the **To-do lists** sidebar.
 
@@ -188,7 +196,7 @@ Alexa normal voice usage is untouched: the Alexa integration keeps using Amazon'
 - **Pause sync:** Settings → Devices & services → To-do List Sync → the pair → ⋮ → **Disable**.
   Lists stop changing immediately. Re-enabling resumes from the stored snapshot.
 - **Restore items:** re-add anything lost from the `todo.get_items` records from setup step 2, or restore the backup.
-- **Roll back this integration:** HACS → Skylight Lists → ⋮ → **Redownload** → choose the previous
+- **Roll back this integration:** HACS → Skylight (ToDo Lists Only) → ⋮ → **Redownload** → choose the previous
   version, restart. Disable sync first.
 - **Update safely:** disable sync pairs, update, restart, confirm the Skylight entities load
   and the disposable-list test still passes, then re-enable sync. Review upstream changes
