@@ -3,7 +3,7 @@
     "step": {
       "user": {
         "title": "Connect Skylight lists",
-        "description": "1. [Open Skylight sign-in]({auth_url}) in a new tab.\\n2. Sign in to Skylight in your browser.\\n3. Copy the value of `code` from the resulting URL (or paste the entire URL) below.\\n\\nThis unofficial integration requests Skylight's broad `everything` scope even though this fork only implements lists.",
+        "description": "1. [Open Skylight sign-in]({auth_url}) in a new tab.\n2. Sign in to Skylight in your browser.\n3. Copy the value of `code` from the resulting URL (or paste the entire URL) below. Codes expire quickly.\n\nThis unofficial integration requests Skylight's broad `everything` scope even though it only uses lists.",
         "data": {
           "code": "Authorization code"
         }
@@ -17,15 +17,17 @@
       }
     },
     "error": {
-      "cannot_connect": "Skylight could not be reached.",
-      "invalid_auth": "Skylight rejected the authorization code. Generate a new one.",
+      "cannot_connect": "Skylight could not be reached or returned an unexpected response. Try again.",
+      "invalid_auth": "Skylight rejected the authorization code. Open the sign-in link again for a fresh one.",
       "invalid_code": "Paste the code from Skylight's authorization URL.",
       "no_frames": "There are no Skylight frames for this account."
     },
     "abort": {
       "already_configured": "This Skylight frame is already configured.",
       "all_frames_configured": "Every Skylight frame is already configured.",
-      "reauth_successful": "Skylight authorization refreshed."
+      "reauth_successful": "Skylight authorization refreshed.",
+      "reconfigure_successful": "Skylight authorization updated.",
+      "wrong_account": "That Skylight account cannot see the frame this entry belongs to."
     }
   },
   "options": {

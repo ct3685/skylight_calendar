@@ -2,35 +2,37 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Coroutine
+from typing import Any
+
 from homeassistant.components.todo import (
     TodoItem,
     TodoItemStatus,
     TodoListEntity,
     TodoListEntityFeature,
 )
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import HomeAssistantError, ServiceValidationError
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .api import SkylightAPI
-from .const import DOMAIN
-from .coordinator import SkylightListsCoordinator
+from . import SkylightConfigEntry
+from .api import SkylightAPI, SkylightAPIError
+from .const import DOMAIN, ITEM_STATUS_COMPLETED, ITEM_STATUS_PENDING
+from .coordinator import SkylightListsCoordinator, fetch_list_items
 
 
 async def async_setup_entry(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    entry: SkylightConfigEntry,
     async_add_entities: AddEntitiesCallback,
 ) -> None:
-    data = hass.data[DOMAIN][entry.entry_id]
-    coordinator: SkylightListsCoordinator = data["lists_coordinator"]
-    api: SkylightAPI = data["api"]
-    frame_id: str = data["frame_id"]
-    frame_name: str = data["frame_name"]
+    data = entry.runtime_data
+    coordinator = data.coordinator
     known: set[str] = set()
 
+    @callback
     def _add_new_lists() -> None:
         created = []
         for list_id, list_data in (coordinator.data or {}).items():
@@ -39,20 +41,25 @@ async def async_setup_entry(
             known.add(list_id)
             created.append(
                 SkylightTodoList(
-                    coordinator, api, frame_id, frame_name,
-                    list_id, list_data["name"]
+                    coordinator,
+                    data.api,
+                    data.frame_id,
+                    data.frame_name,
+                    list_id,
+                    list_data["name"],
                 )
             )
         if created:
             async_add_entities(created)
 
     _add_new_lists()
+    entry.async_on_unload(coordinator.async_add_listener(_add_new_lists))
 
-    @callback
-    def _on_refresh() -> None:
-        _add_new_lists()
 
-    entry.async_on_unload(coordinator.async_add_listener(_on_refresh))
+def _skylight_status(status: TodoItemStatus) -> str:
+    if status == TodoItemStatus.COMPLETED:
+        return ITEM_STATUS_COMPLETED
+    return ITEM_STATUS_PENDING
 
 
 class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEntity):
@@ -85,9 +92,22 @@ class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEnti
             model="Calendar Frame",
         )
 
+    def _list_data(self) -> dict[str, Any] | None:
+        return (self.coordinator.data or {}).get(self._list_id)
+
+    @property
+    def available(self) -> bool:
+        # A list deleted in Skylight must not look like an empty list.
+        return super().available and self._list_data() is not None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self._list_data() or {}
+        return {"skylight_list_id": self._list_id, "skylight_kind": data.get("kind")}
+
     @property
     def todo_items(self) -> list[TodoItem] | None:
-        data = (self.coordinator.data or {}).get(self._list_id)
+        data = self._list_data()
         if data is None:
             return None
         return [
@@ -96,42 +116,87 @@ class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEnti
                 uid=item["id"],
                 status=(
                     TodoItemStatus.COMPLETED
-                    if item["status"] == "completed"
+                    if item["status"] == ITEM_STATUS_COMPLETED
                     else TodoItemStatus.NEEDS_ACTION
                 ),
             )
             for item in data["items"]
         ]
 
+    def _current_item(self, uid: str) -> dict[str, Any] | None:
+        for item in (self._list_data() or {}).get("items", []):
+            if item["id"] == uid:
+                return item
+        return None
+
+    async def _call(self, func: Callable[..., Coroutine[Any, Any, Any]], *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await func(*args, **kwargs)
+        except SkylightAPIError as err:
+            raise HomeAssistantError(str(err)) from None
+
     async def async_create_todo_item(self, item: TodoItem) -> None:
-        await self._api.add_list_item(
-            self._frame_id, self._list_id, item.summary or ""
-        )
+        label = (item.summary or "").strip()
+        if not label:
+            raise ServiceValidationError("A Skylight list item needs a name")
+        await self._call(self._api.add_list_item, self._frame_id, self._list_id, label)
         await self.coordinator.async_request_refresh()
 
     async def async_update_todo_item(self, item: TodoItem) -> None:
         if not item.uid:
-            return
-        attrs = {}
+            raise ServiceValidationError("The Skylight list item has no id")
+        current = self._current_item(item.uid)
+        label: str | None = None
+        status: str | None = None
         if item.summary is not None:
-            # The Skylight list-item API uses "label" in both reads and creates.
-            # Rename updates need live testing against a disposable list.
-            attrs["label"] = item.summary
+            label = item.summary.strip()
+            if not label:
+                raise ServiceValidationError("A Skylight list item needs a name")
+            if current is not None and current["name"] == label:
+                label = None
         if item.status is not None:
-            attrs["status"] = (
-                "completed"
-                if item.status == TodoItemStatus.COMPLETED
-                else "pending"
-            )
-        if attrs:
-            await self._api.update_list_item(
-                self._frame_id, self._list_id, item.uid, attrs
-            )
-            await self.coordinator.async_request_refresh()
+            status = _skylight_status(item.status)
+            if current is not None and current["status"] == status:
+                status = None
+        if label is None and status is None:
+            return
+        await self._call(
+            self._api.update_list_item,
+            self._frame_id,
+            self._list_id,
+            item.uid,
+            label=label,
+            status=status,
+        )
+        await self.coordinator.async_request_refresh()
 
     async def async_delete_todo_items(self, uids: list[str]) -> None:
         for uid in uids:
-            await self._api.delete_list_item(
-                self._frame_id, self._list_id, uid
+            await self._call(
+                self._api.delete_list_item, self._frame_id, self._list_id, uid
             )
+        remaining = await self._remaining(uids)
+        if remaining:
+            # Some clients report single-item DELETE as accepted but ignored;
+            # the web app's bulk endpoint is the fallback.
+            await self._call(
+                self._api.bulk_delete_list_items,
+                self._frame_id,
+                self._list_id,
+                remaining,
+            )
+            remaining = await self._remaining(uids)
         await self.coordinator.async_request_refresh()
+        if remaining:
+            raise HomeAssistantError(
+                f"Skylight did not delete {len(remaining)} list item(s)"
+            )
+
+    async def _remaining(self, uids: list[str]) -> list[str]:
+        """Which of the uids Skylight still lists; [] if that can't be read."""
+        try:
+            items = await fetch_list_items(self._api, self._frame_id, self._list_id)
+        except SkylightAPIError:
+            return []
+        present = {item["id"] for item in items}
+        return [uid for uid in uids if uid in present]
