@@ -31,7 +31,8 @@ for that.
 - A Skylight list that is deleted (or disappears from the feed) turns its entity `unavailable`, not empty.
 - Completing an item keeps it in Skylight as completed (`status: completed`); un-completing sets `pending`.
 - Deletes are verified: after `DELETE`, the list is re-read. Items still present are retried
-  through Skylight's `bulk_destroy` endpoint. If they still remain, the action fails visibly.
+  through Skylight's `bulk_destroy` endpoint. If they still remain, or the list cannot be
+  re-read, the action fails visibly. An unverified delete is never reported as done.
 - Duplicate item names are allowed. Items are addressed by their Skylight id.
 - Write failures raise an error from the `todo.*` action, so a sync engine sees them.
 
@@ -224,4 +225,7 @@ python3.14 -m venv .venv && .venv/bin/pip install -r requirements_test.txt
 
 Tests run Home Assistant 2026.10 (via `pytest-homeassistant-custom-component`) against an
 in-memory model of the Skylight list API (`tests/conftest.py`). They cover auth/refresh,
-item CRUD, outages and partial reads, and log/secret hygiene. CI runs the same checks plus hassfest and HACS validation.
+item CRUD, outages and partial reads, and log/secret hygiene.
+`scripts/ha_core_smoke.py` boots a real Home Assistant 2026.11.1 core with the same fake
+(config flow, every todo action, outage, unload; real network calls are blocked).
+CI runs both, plus hassfest and HACS validation.

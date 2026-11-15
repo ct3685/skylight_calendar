@@ -26,6 +26,20 @@ jobs:
       - name: Tests
         run: pytest -q
 
+  core-smoke:
+    name: Real Home Assistant 2026.11.1 core smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Install Home Assistant 2026.11.1
+        # The frontend keeps HA out of recovery mode, which disables custom integrations.
+        run: pip install homeassistant==2026.11.1 home-assistant-frontend==20261028.5 pytest
+      - name: Smoke test
+        run: python scripts/ha_core_smoke.py
+
   hassfest:
     name: Hassfest
     runs-on: ubuntu-latest
