@@ -40,4 +40,5 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          ignore: brands
+          # Repo-settings checks for the default HACS store; this is a custom repository.
+          ignore: brands topics issues
