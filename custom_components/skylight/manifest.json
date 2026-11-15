@@ -1,11 +1,13 @@
 {
   "domain": "skylight",
-  "name": "Skylight",
-  "version": "3.0.0",
-  "documentation": "https://github.com/MegaTheLEGEND/skylight_calendar",
-  "issue_tracker": "https://github.com/MegaTheLEGEND/skylight_calendar/issues",
-  "requirements": ["python-dateutil>=2.8"],
-  "codeowners": ["@megathelegend", "@devinslick"],
+  "name": "Skylight Lists (Reviewed Fork)",
+  "version": "3.0.1",
+  "documentation": "https://github.com/ct3685/skylight_calendar",
+  "issue_tracker": "https://github.com/ct3685/skylight_calendar/issues",
+  "requirements": [],
+  "codeowners": [
+    "@ct3685"
+  ],
   "integration_type": "hub",
   "iot_class": "cloud_polling",
   "config_flow": true
