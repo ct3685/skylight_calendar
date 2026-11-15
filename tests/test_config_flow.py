@@ -68,6 +68,7 @@ async def test_reauth_updates_tokens(hass: HomeAssistant, skylight: FakeSkylight
     entry.add_to_hass(hass)
     result = await entry.start_reauth_flow(hass)
     result = await hass.config_entries.flow.async_configure(result["flow_id"], {"code": "good-code"})
+    await hass.async_block_till_done()
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
     assert entry.data[CONF_ACCESS_TOKEN] == skylight.access_token
