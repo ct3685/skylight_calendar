@@ -144,6 +144,27 @@ async def test_rename(hass: HomeAssistant, skylight: FakeSkylight, entry_data) -
     assert skylight.calls_to("PUT", r"/list_items/")[0].json == {"label": "Oat milk"}
 
 
+async def test_rapid_writes_within_refresh_cooldown_are_not_dropped(
+    hass: HomeAssistant, skylight: FakeSkylight, entry_data
+) -> None:
+    await setup(hass, entry_data)
+    await todo(hass, "add_item", {"item": "Milk"})
+    (uid,) = skylight.lists["1"]["items"]
+    assert [i["summary"] for i in await get_items(hass)] == ["Milk"]
+    await todo(hass, "update_item", {"item": uid, "status": "completed"})
+    await todo(hass, "update_item", {"item": uid, "status": "needs_action"})
+    await todo(hass, "update_item", {"item": uid, "rename": "Oat milk"})
+    await todo(hass, "update_item", {"item": uid, "rename": "Milk"})
+    await todo(hass, "add_item", {"item": "Eggs"})
+    assert [c.json for c in skylight.calls_to("PUT", r"/list_items/")] == [
+        {"status": "completed"}, {"status": "pending"}, {"label": "Oat milk"}, {"label": "Milk"},
+    ]
+    assert skylight.lists["1"]["items"][uid] == {"label": "Milk", "status": "pending", "position": 0}
+    assert [(i["summary"], i["status"]) for i in await get_items(hass)] == [
+        ("Milk", "needs_action"), ("Eggs", "needs_action"),
+    ]
+
+
 async def test_unchanged_update_sends_nothing(hass: HomeAssistant, skylight: FakeSkylight, entry_data) -> None:
     uid = skylight.add_item("1", "Milk")
     await setup(hass, entry_data)
@@ -178,6 +199,87 @@ async def test_delete_that_never_happens_is_an_error(hass: HomeAssistant, skylig
     with pytest.raises(HomeAssistantError, match="did not delete"):
         await todo(hass, "remove_item", {"item": [uid]})
     assert uid in skylight.lists["1"]["items"]
+
+
+PARTIAL_READ = b'{"data":{"id":"1","relationships":{"list_items":{"data":[{"id":"7"}]}}}}'
+VERIFY_FAILURES = [503, TimeoutError(), b"{broken", PARTIAL_READ]
+
+
+async def test_delete_is_verified_and_leaves_other_items(
+    hass: HomeAssistant, skylight: FakeSkylight, entry_data
+) -> None:
+    keep = skylight.add_item("1", "Eggs", "completed")
+    other_list = skylight.add_item("2", "Paper towels")
+    uid = skylight.add_item("1", "Milk")
+    await setup(hass, entry_data)
+    reads_before = len(skylight.calls_to("GET", r"/lists/1$"))
+    await todo(hass, "remove_item", {"item": [uid]})
+    assert skylight.lists["1"]["items"] == {keep: {"label": "Eggs", "status": "completed", "position": 0}}
+    assert list(skylight.lists["2"]["items"]) == [other_list]
+    assert [c.url.path.rsplit("/", 1)[1] for c in skylight.calls_to("DELETE", r"")] == [uid]
+    # The verification read is published directly; no extra full refresh.
+    assert len(skylight.calls_to("GET", r"/lists/1$")) == reads_before + 1
+    assert [i["summary"] for i in await get_items(hass)] == ["Eggs"]
+
+
+@pytest.mark.parametrize("failure", VERIFY_FAILURES)
+async def test_failed_verification_is_an_error_not_a_success(
+    hass: HomeAssistant, skylight: FakeSkylight, entry_data, failure: object
+) -> None:
+    keep = skylight.add_item("1", "Eggs")
+    uid = skylight.add_item("1", "Milk")
+    await setup(hass, entry_data)
+    skylight.ignore_single_delete = True
+    skylight.fail("GET", r"/lists/1$", failure)
+    with pytest.raises(HomeAssistantError, match="Could not confirm") as err:
+        await todo(hass, "remove_item", {"item": [uid]})
+    assert "SECRET" not in str(err.value)
+    # Nothing further is attempted on an unverified state.
+    assert not skylight.calls_to("DELETE", r"bulk_destroy")
+    assert set(skylight.lists["1"]["items"]) == {keep, uid}
+    # The entity refreshed and still shows the undeleted item.
+    assert sorted(i["summary"] for i in await get_items(hass)) == ["Eggs", "Milk"]
+
+
+@pytest.mark.parametrize("failure", VERIFY_FAILURES)
+async def test_failed_verification_after_bulk_fallback_is_an_error(
+    hass: HomeAssistant, skylight: FakeSkylight, entry_data, failure: object
+) -> None:
+    keep = skylight.add_item("1", "Eggs")
+    uid = skylight.add_item("1", "Milk")
+    await setup(hass, entry_data)
+    skylight.ignore_single_delete = True
+
+    def bulk_then_fail_reads() -> bytes:
+        skylight.lists["1"]["items"].pop(uid)
+        skylight.fail("GET", r"/lists/1$", failure)
+        return b""
+
+    skylight.fail("DELETE", r"bulk_destroy", bulk_then_fail_reads)
+    with pytest.raises(HomeAssistantError, match="Could not confirm"):
+        await todo(hass, "remove_item", {"item": [uid]})
+    assert list(skylight.lists["1"]["items"]) == [keep]
+
+
+@pytest.mark.parametrize("failure", [503, 500, 429, TimeoutError()])
+async def test_outage_during_delete_then_recovery(
+    hass: HomeAssistant, skylight: FakeSkylight, entry_data, failure: object
+) -> None:
+    keep = skylight.add_item("1", "Eggs")
+    first = skylight.add_item("1", "Milk")
+    second = skylight.add_item("1", "Bread")
+    await setup(hass, entry_data)
+    skylight.fail("DELETE", rf"/list_items/{second}$", failure)
+    with pytest.raises(HomeAssistantError):
+        await todo(hass, "remove_item", {"item": [first, second]})
+    # The first delete went through; the failed one and the unrelated item remain.
+    assert set(skylight.lists["1"]["items"]) == {keep, second}
+    assert not skylight.calls_to("DELETE", r"bulk_destroy")
+    assert sorted(i["summary"] for i in await get_items(hass)) == ["Bread", "Eggs"]
+    # Retrying after the outage succeeds and is verified.
+    await todo(hass, "remove_item", {"item": [second]})
+    assert list(skylight.lists["1"]["items"]) == [keep]
+    assert [i["summary"] for i in await get_items(hass)] == ["Eggs"]
 
 
 async def test_duplicate_names_target_by_uid(hass: HomeAssistant, skylight: FakeSkylight, entry_data) -> None:

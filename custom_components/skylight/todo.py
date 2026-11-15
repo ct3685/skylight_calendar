@@ -20,7 +20,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from . import SkylightConfigEntry
 from .api import SkylightAPI, SkylightAPIError
 from .const import DOMAIN, ITEM_STATUS_COMPLETED, ITEM_STATUS_PENDING
-from .coordinator import SkylightListsCoordinator, fetch_list_items
+from .coordinator import SkylightListsCoordinator, fetch_list_items, parse_item
 
 
 async def async_setup_entry(
@@ -139,7 +139,18 @@ class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEnti
         label = (item.summary or "").strip()
         if not label:
             raise ServiceValidationError("A Skylight list item needs a name")
-        await self._call(self._api.add_list_item, self._frame_id, self._list_id, label)
+        response = await self._call(
+            self._api.add_list_item, self._frame_id, self._list_id, label
+        )
+        record = response.get("data") if isinstance(response, dict) else None
+        try:
+            created = parse_item(record) if isinstance(record, dict) else None
+        except SkylightAPIError:
+            created = None
+        if created is not None:
+            items = (self._list_data() or {}).get("items", [])
+            if all(existing["id"] != created["id"] for existing in items):
+                self._set_items([*items, created])
         await self.coordinator.async_request_refresh()
 
     async def async_update_todo_item(self, item: TodoItem) -> None:
@@ -168,35 +179,70 @@ class SkylightTodoList(CoordinatorEntity[SkylightListsCoordinator], TodoListEnti
             label=label,
             status=status,
         )
+        # Writes inside the refresh cooldown compare against this copy, so it
+        # must reflect the accepted change before the refresh lands.
+        changes = {"name": label, "status": status}
+        self._set_items(
+            [
+                {**it, **{k: v for k, v in changes.items() if v is not None}}
+                if it["id"] == item.uid
+                else it
+                for it in (self._list_data() or {}).get("items", [])
+            ]
+        )
         await self.coordinator.async_request_refresh()
 
     async def async_delete_todo_items(self, uids: list[str]) -> None:
-        for uid in uids:
-            await self._call(
-                self._api.delete_list_item, self._frame_id, self._list_id, uid
-            )
-        remaining = await self._remaining(uids)
-        if remaining:
-            # Some clients report single-item DELETE as accepted but ignored;
-            # the web app's bulk endpoint is the fallback.
-            await self._call(
-                self._api.bulk_delete_list_items,
-                self._frame_id,
-                self._list_id,
-                remaining,
-            )
-            remaining = await self._remaining(uids)
-        await self.coordinator.async_request_refresh()
-        if remaining:
-            raise HomeAssistantError(
-                f"Skylight did not delete {len(remaining)} list item(s)"
-            )
-
-    async def _remaining(self, uids: list[str]) -> list[str]:
-        """Which of the uids Skylight still lists; [] if that can't be read."""
+        uids = list(dict.fromkeys(uids))
+        verified: list[dict[str, Any]] | None = None
         try:
-            items = await fetch_list_items(self._api, self._frame_id, self._list_id)
-        except SkylightAPIError:
-            return []
-        present = {item["id"] for item in items}
-        return [uid for uid in uids if uid in present]
+            for uid in uids:
+                await self._call(
+                    self._api.delete_list_item, self._frame_id, self._list_id, uid
+                )
+            items = await self._verified_items()
+            remaining = _present(items, uids)
+            if remaining:
+                # Some clients report single-item DELETE as accepted but ignored;
+                # the web app's bulk endpoint is the fallback.
+                await self._call(
+                    self._api.bulk_delete_list_items,
+                    self._frame_id,
+                    self._list_id,
+                    remaining,
+                )
+                items = await self._verified_items()
+                remaining = _present(items, uids)
+            verified = items
+            if remaining:
+                raise HomeAssistantError(
+                    f"Skylight did not delete {len(remaining)} list item(s)"
+                )
+        finally:
+            if verified is None or not self._set_items(verified):
+                await self.coordinator.async_request_refresh()
+
+    async def _verified_items(self) -> list[dict[str, Any]]:
+        """A fresh read of this list; raises, because an unverified delete
+        must never count as done."""
+        try:
+            return await fetch_list_items(self._api, self._frame_id, self._list_id)
+        except SkylightAPIError as err:
+            raise HomeAssistantError(
+                f"Could not confirm the Skylight deletion: {err}"
+            ) from None
+
+    def _set_items(self, items: list[dict[str, Any]]) -> bool:
+        """Show this list's known state now instead of after the refresh cooldown."""
+        data = self.coordinator.data
+        if not self.coordinator.last_update_success or not data or self._list_id not in data:
+            return False
+        self.coordinator.async_set_updated_data(
+            {**data, self._list_id: {**data[self._list_id], "items": items}}
+        )
+        return True
+
+
+def _present(items: list[dict[str, Any]], uids: list[str]) -> list[str]:
+    ids = {item["id"] for item in items}
+    return [uid for uid in uids if uid in ids]

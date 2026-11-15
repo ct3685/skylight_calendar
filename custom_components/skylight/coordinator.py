@@ -31,7 +31,7 @@ def _position(value: Any) -> float:
         return 0.0
 
 
-def _parse_item(obj: dict[str, Any]) -> dict[str, Any]:
+def parse_item(obj: dict[str, Any]) -> dict[str, Any]:
     item_id = obj.get("id")
     if item_id is None or str(item_id) == "":
         raise SkylightAPIError("Skylight returned a list item without an id")
@@ -55,7 +55,7 @@ def _collect(records: list[Any]) -> list[dict[str, Any]]:
     for obj in records:
         if not isinstance(obj, dict) or obj.get("type") != "list_item":
             continue
-        item = _parse_item(obj)
+        item = parse_item(obj)
         items.setdefault(item["id"], item)
     return sorted(items.values(), key=lambda item: item["position"])
 
